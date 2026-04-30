@@ -14,6 +14,29 @@ function Expand-AgentPath {
     return [Environment]::ExpandEnvironmentVariables($Path)
 }
 
+function ConvertTo-AgentIsoTimestamp {
+    return (Get-Date).ToUniversalTime().ToString('o')
+}
+
+function Get-AgentObjectPropertyValue {
+    param(
+        [Parameter(Mandatory)]$InputObject,
+        [Parameter(Mandatory)][string]$Name,
+        $Default = $null
+    )
+
+    if ($null -eq $InputObject) {
+        return $Default
+    }
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $Default
+    }
+
+    return $property.Value
+}
+
 function Get-AgentSystemConfig {
     [CmdletBinding()]
     param(
@@ -24,7 +47,12 @@ function Get-AgentSystemConfig {
     )
 
     $sourceRoot = Get-AgentSystemSourceRoot
-    $configPath = Join-Path $sourceRoot 'config\agent-system.json'
+    $configPath = if ($env:AGENT_SYSTEM_CONFIG_PATH) {
+        $env:AGENT_SYSTEM_CONFIG_PATH
+    }
+    else {
+        Join-Path $sourceRoot 'config\agent-system.json'
+    }
     if (-not (Test-Path -LiteralPath $configPath)) {
         throw "Missing config file: $configPath"
     }
@@ -143,6 +171,347 @@ function Test-AgentWslFile {
     }
 
     return ($exitCode -eq 0)
+}
+
+function Invoke-AgentWslCapture {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DistroName,
+        [Parameter(Mandatory)][string]$Command,
+        [string]$User = 'root'
+    )
+
+    $args = @('-d', $DistroName, '-u', $User, '--', 'bash', '-lc', $Command)
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & wsl.exe @args 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output   = @($output | ForEach-Object { "$_" })
+    }
+}
+
+function Test-AgentWslCommand {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DistroName,
+        [Parameter(Mandatory)][string]$Command,
+        [string]$User = 'root'
+    )
+
+    $result = Invoke-AgentWslCapture -DistroName $DistroName -Command $Command -User $User
+    return ($result.ExitCode -eq 0)
+}
+
+function Get-AgentSystemProbeState {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Config)
+
+    if ($env:AGENT_SYSTEM_TEST_PROBE_PATH) {
+        $probePath = $env:AGENT_SYSTEM_TEST_PROBE_PATH
+        if (-not (Test-Path -LiteralPath $probePath)) {
+            throw "AGENT_SYSTEM_TEST_PROBE_PATH does not exist: $probePath"
+        }
+
+        $fixture = Get-Content -LiteralPath $probePath -Raw | ConvertFrom-Json
+        $fixtureDistros = @(Get-AgentObjectPropertyValue -InputObject $fixture -Name 'wslDistros' -Default @())
+        $fixtureDistroPresent = [bool](Get-AgentObjectPropertyValue -InputObject $fixture -Name 'distroPresent' -Default ($fixtureDistros -contains $Config.DistroName))
+
+        return [pscustomobject]@{
+            DistroPresent       = $fixtureDistroPresent
+            WslDistros          = $fixtureDistros
+            PayloadInstalled    = [bool](Get-AgentObjectPropertyValue -InputObject $fixture -Name 'payloadInstalled' -Default $false)
+            RestartRequired     = [bool](Get-AgentObjectPropertyValue -InputObject $fixture -Name 'restartRequired' -Default $false)
+            SystemdActive       = [bool](Get-AgentObjectPropertyValue -InputObject $fixture -Name 'systemdActive' -Default $false)
+            UbuntuDescription   = [string](Get-AgentObjectPropertyValue -InputObject $fixture -Name 'ubuntuDescription' -Default $null)
+            DockerInstalled     = [bool](Get-AgentObjectPropertyValue -InputObject $fixture -Name 'dockerInstalled' -Default $false)
+            DockerDaemonRunning = [bool](Get-AgentObjectPropertyValue -InputObject $fixture -Name 'dockerDaemonRunning' -Default $false)
+            HermesInstalled     = [bool](Get-AgentObjectPropertyValue -InputObject $fixture -Name 'hermesInstalled' -Default $false)
+            HermesGatewayRunning = [bool](Get-AgentObjectPropertyValue -InputObject $fixture -Name 'hermesGatewayRunning' -Default $false)
+        }
+    }
+
+    $distros = Get-WslDistros
+    $distroPresent = $distros -contains $Config.DistroName
+    $payloadInstalled = $false
+    $restartRequired = $false
+    $systemdActive = $false
+    $dockerInstalled = $false
+    $dockerDaemonRunning = $false
+    $hermesInstalled = $false
+    $hermesGatewayRunning = $false
+    $ubuntuDescription = $null
+
+    if ($distroPresent) {
+        $payloadInstalled = Test-AgentWslFile -DistroName $Config.DistroName -Path '/usr/local/bin/agent-system-status'
+    }
+
+    if ($payloadInstalled) {
+        $restartRequired = Test-AgentWslFile -DistroName $Config.DistroName -Path '/var/lib/agent-system/restart-required'
+
+        $ubuntu = Invoke-AgentWslCapture -DistroName $Config.DistroName -Command 'lsb_release -ds 2>/dev/null || . /etc/os-release && printf "%s\n" "${PRETTY_NAME:-$NAME}"'
+        if ($ubuntu.ExitCode -eq 0) {
+            $ubuntuDescription = ($ubuntu.Output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+        }
+
+        $systemdResult = Invoke-AgentWslCapture -DistroName $Config.DistroName -Command 'ps -p 1 -o comm= | tr -d " "'
+        if ($systemdResult.ExitCode -eq 0) {
+            $systemdActive = (($systemdResult.Output | Select-Object -First 1) -eq 'systemd')
+        }
+
+        $dockerInstalled = Test-AgentWslCommand -DistroName $Config.DistroName -Command 'command -v docker >/dev/null 2>&1'
+        if ($dockerInstalled) {
+            $dockerDaemonRunning = Test-AgentWslCommand -DistroName $Config.DistroName -Command 'docker info >/dev/null 2>&1'
+        }
+
+        $user = ConvertTo-AgentBashSingleQuoted $Config.WslUser
+        $hermesCheck = "sudo -H -u $user bash -lc 'export PATH=`"$HOME/.local/bin:$PATH`"; command -v hermes >/dev/null 2>&1'"
+        $hermesInstalled = Test-AgentWslCommand -DistroName $Config.DistroName -Command $hermesCheck
+        if ($hermesInstalled) {
+            $gatewayCheck = "sudo -H -u $user bash -lc 'tmux has-session -t ''hermes-gateway'' 2>/dev/null'"
+            $hermesGatewayRunning = Test-AgentWslCommand -DistroName $Config.DistroName -Command $gatewayCheck
+        }
+    }
+
+    return [pscustomobject]@{
+        DistroPresent        = $distroPresent
+        WslDistros           = @($distros)
+        PayloadInstalled     = $payloadInstalled
+        RestartRequired      = $restartRequired
+        SystemdActive        = $systemdActive
+        UbuntuDescription    = $ubuntuDescription
+        DockerInstalled      = $dockerInstalled
+        DockerDaemonRunning  = $dockerDaemonRunning
+        HermesInstalled      = $hermesInstalled
+        HermesGatewayRunning = $hermesGatewayRunning
+    }
+}
+
+function New-AgentSystemCheck {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string]$Status,
+        [Parameter(Mandatory)][string]$Message,
+        [string]$ErrorCode,
+        $Details = $null
+    )
+
+    $record = [ordered]@{
+        id      = $Id
+        status  = $Status
+        message = $Message
+    }
+
+    if ($ErrorCode) {
+        $record.error_code = $ErrorCode
+    }
+
+    if ($null -ne $Details) {
+        $record.details = $Details
+    }
+
+    return [pscustomobject]$record
+}
+
+function Get-AgentSystemStatusRecord {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Config)
+
+    $probe = Get-AgentSystemProbeState -Config $Config
+    $checks = New-Object System.Collections.Generic.List[object]
+    $errorCodes = New-Object System.Collections.Generic.List[string]
+    $state = 'ready'
+    $summary = 'Agent payload is installed and ready for read-only checks.'
+
+    if (-not $probe.DistroPresent) {
+        $checks.Add((New-AgentSystemCheck -Id 'wsl_distro' -Status 'fail' -Message 'WSL distro is not installed.' -ErrorCode 'WSL_MISSING' -Details @{ distro = $Config.DistroName }))
+        $errorCodes.Add('WSL_MISSING')
+        $state = 'blocked'
+        $summary = 'WSL distro is not installed.'
+    }
+    else {
+        $checks.Add((New-AgentSystemCheck -Id 'wsl_distro' -Status 'pass' -Message 'WSL distro is installed.' -Details @{ distro = $Config.DistroName }))
+
+        if (-not $probe.PayloadInstalled) {
+            $checks.Add((New-AgentSystemCheck -Id 'payload' -Status 'fail' -Message 'WSL distro exists, but the Agent payload is not installed yet.' -ErrorCode 'PAYLOAD_NOT_INSTALLED'))
+            $errorCodes.Add('PAYLOAD_NOT_INSTALLED')
+            $state = 'blocked'
+            $summary = 'WSL distro exists, but the Agent payload is not installed yet.'
+        }
+        else {
+            $checks.Add((New-AgentSystemCheck -Id 'payload' -Status 'pass' -Message 'Agent payload is installed inside the WSL distro.'))
+
+            if ($probe.RestartRequired) {
+                $checks.Add((New-AgentSystemCheck -Id 'restart_required' -Status 'warn' -Message 'A WSL restart is required before the payload is fully active.' -ErrorCode 'REBOOT_REQUIRED'))
+                $errorCodes.Add('REBOOT_REQUIRED')
+                if ($state -eq 'ready') {
+                    $state = 'warning'
+                }
+                $summary = 'Agent payload is installed, but a WSL restart is still required.'
+            }
+            else {
+                $checks.Add((New-AgentSystemCheck -Id 'restart_required' -Status 'pass' -Message 'No WSL restart is pending.'))
+            }
+
+            if ($probe.DockerInstalled) {
+                if ($probe.DockerDaemonRunning) {
+                    $checks.Add((New-AgentSystemCheck -Id 'docker_daemon' -Status 'pass' -Message 'Docker is installed and the daemon is reachable.'))
+                }
+                else {
+                    $checks.Add((New-AgentSystemCheck -Id 'docker_daemon' -Status 'warn' -Message 'Docker is installed, but the daemon is not reachable.' -ErrorCode 'DOCKER_DAEMON_FAILED'))
+                    $errorCodes.Add('DOCKER_DAEMON_FAILED')
+                    if ($state -eq 'ready') {
+                        $state = 'warning'
+                    }
+                    if ($summary -eq 'Agent payload is installed and ready for read-only checks.') {
+                        $summary = 'Agent payload is installed, but Docker is not ready.'
+                    }
+                }
+            }
+            else {
+                $checks.Add((New-AgentSystemCheck -Id 'docker_daemon' -Status 'warn' -Message 'Docker is not installed in the WSL distro.'))
+                if ($state -eq 'ready') {
+                    $state = 'warning'
+                }
+            }
+
+            if ($probe.HermesInstalled) {
+                $gatewayStatus = if ($probe.HermesGatewayRunning) { 'pass' } else { 'warn' }
+                $gatewayMessage = if ($probe.HermesGatewayRunning) {
+                    'Hermes is installed and the gateway tmux session is running.'
+                }
+                else {
+                    'Hermes is installed, but the gateway tmux session is not running.'
+                }
+                $checks.Add((New-AgentSystemCheck -Id 'hermes_gateway' -Status $gatewayStatus -Message $gatewayMessage))
+                if (($gatewayStatus -eq 'warn') -and ($state -eq 'ready')) {
+                    $state = 'warning'
+                }
+            }
+            else {
+                $checks.Add((New-AgentSystemCheck -Id 'hermes_gateway' -Status 'warn' -Message 'Hermes is not installed in the WSL distro.'))
+                if ($state -eq 'ready') {
+                    $state = 'warning'
+                }
+            }
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        '$schema'       = './schemas/operation.schema.json'
+        schema_version  = '1.0'
+        operation       = 'status'
+        generated_at    = ConvertTo-AgentIsoTimestamp
+        state           = $state
+        summary         = $summary
+        error_codes     = @($errorCodes | Select-Object -Unique)
+        config          = [ordered]@{
+            distro_name  = $Config.DistroName
+            wsl_user     = $Config.WslUser
+            install_root = $Config.InstallRoot
+            program_root = $Config.ProgramRoot
+            task_name    = $Config.TaskName
+        }
+        environment     = [ordered]@{
+            ubuntu_description    = $probe.UbuntuDescription
+            systemd_active        = $probe.SystemdActive
+            docker_installed      = $probe.DockerInstalled
+            docker_daemon_running = $probe.DockerDaemonRunning
+            hermes_installed      = $probe.HermesInstalled
+            hermes_gateway_running = $probe.HermesGatewayRunning
+            restart_required      = $probe.RestartRequired
+        }
+        checks          = @($checks)
+    }
+}
+
+function Get-AgentSystemPreflightRecord {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Config)
+
+    $statusRecord = Get-AgentSystemStatusRecord -Config $Config
+    $recommendedActions = New-Object System.Collections.Generic.List[object]
+
+    if ($statusRecord.error_codes -contains 'WSL_MISSING') {
+        $recommendedActions.Add([ordered]@{
+            label              = 'install'
+            command            = '.\scripts\Install-AgentSystem.ps1'
+            requires_elevation = $true
+            reason             = 'Install WSL, the Ubuntu distro, and the Agent payload.'
+        })
+    }
+    elseif ($statusRecord.error_codes -contains 'PAYLOAD_NOT_INSTALLED') {
+        $recommendedActions.Add([ordered]@{
+            label              = 'install'
+            command            = '.\scripts\Install-AgentSystem.ps1'
+            requires_elevation = $true
+            reason             = 'Install the Agent payload into the existing WSL distro.'
+        })
+    }
+    elseif ($statusRecord.error_codes -contains 'REBOOT_REQUIRED') {
+        $recommendedActions.Add([ordered]@{
+            label              = 'resume_after_reboot'
+            command            = '.\scripts\Install-AgentSystem.ps1'
+            requires_elevation = $true
+            reason             = 'Restart WSL or Windows, then rerun the installer to finish activation.'
+        })
+    }
+    else {
+        $recommendedActions.Add([ordered]@{
+            label              = 'start'
+            command            = '.\bin\agent-system.ps1 start'
+            requires_elevation = $false
+            reason             = 'The read-only checks passed; the services can be started if needed.'
+        })
+    }
+
+    return [pscustomobject][ordered]@{
+        '$schema'            = './schemas/operation.schema.json'
+        schema_version       = '1.0'
+        operation            = 'preflight'
+        generated_at         = ConvertTo-AgentIsoTimestamp
+        state                = $statusRecord.state
+        summary              = $statusRecord.summary
+        mutates_system       = $false
+        ready_for            = [ordered]@{
+            read_only_checks = $true
+            install          = $true
+            start            = ($statusRecord.state -ne 'blocked')
+        }
+        recommended_actions  = @($recommendedActions)
+        error_codes          = $statusRecord.error_codes
+        config               = $statusRecord.config
+        environment          = $statusRecord.environment
+        checks               = $statusRecord.checks
+    }
+}
+
+function Write-AgentSystemPreflightText {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Record)
+
+    Write-Host 'Agent System Preflight'
+    Write-Host "  State:   $($Record.state)"
+    Write-Host "  Summary: $($Record.summary)"
+    Write-Host ''
+    Write-Host 'Checks:'
+    foreach ($check in $Record.checks) {
+        $suffix = if ($check.PSObject.Properties['error_code']) { " [$($check.error_code)]" } else { '' }
+        Write-Host ("  - {0}: {1}{2}" -f $check.id, $check.message, $suffix)
+    }
+    Write-Host ''
+    Write-Host 'Recommended actions:'
+    foreach ($action in $Record.recommended_actions) {
+        $elevation = if ($action.requires_elevation) { 'elevated' } else { 'standard' }
+        Write-Host ("  - {0} ({1}): {2}" -f $action.command, $elevation, $action.reason)
+    }
 }
 
 function ConvertTo-AgentBashSingleQuoted {
@@ -497,10 +866,18 @@ function Get-AgentSystemStatus {
         [string]$DistroName,
         [string]$WslUser,
         [string]$InstallRoot,
-        [string]$ProgramRoot
+        [string]$ProgramRoot,
+        [ValidateSet('text', 'json')]
+        [string]$OutputFormat = 'text'
     )
 
     $config = Get-AgentSystemConfig -DistroName $DistroName -WslUser $WslUser -InstallRoot $InstallRoot -ProgramRoot $ProgramRoot
+
+    if ($OutputFormat -eq 'json') {
+        $record = Get-AgentSystemStatusRecord -Config $config
+        $record | ConvertTo-Json -Depth 8
+        return
+    }
 
     Write-Host "Agent System"
     Write-Host "  ProgramRoot: $($config.ProgramRoot)"
@@ -522,6 +899,28 @@ function Get-AgentSystemStatus {
     }
 
     Invoke-AgentWsl -DistroName $config.DistroName -Command '/usr/local/bin/agent-system-status' -AllowNonZero | Out-Null
+}
+
+function Invoke-AgentSystemPreflight {
+    [CmdletBinding()]
+    param(
+        [string]$DistroName,
+        [string]$WslUser,
+        [string]$InstallRoot,
+        [string]$ProgramRoot,
+        [ValidateSet('text', 'json')]
+        [string]$OutputFormat = 'text'
+    )
+
+    $config = Get-AgentSystemConfig -DistroName $DistroName -WslUser $WslUser -InstallRoot $InstallRoot -ProgramRoot $ProgramRoot
+    $record = Get-AgentSystemPreflightRecord -Config $config
+
+    if ($OutputFormat -eq 'json') {
+        $record | ConvertTo-Json -Depth 8
+        return
+    }
+
+    Write-AgentSystemPreflightText -Record $record
 }
 
 function Get-AgentSystemLogs {
@@ -695,6 +1094,7 @@ Export-ModuleMember -Function `
     Start-AgentSystem, `
     Stop-AgentSystem, `
     Get-AgentSystemStatus, `
+    Invoke-AgentSystemPreflight, `
     Get-AgentSystemLogs, `
     Invoke-HermesSetup, `
     Uninstall-AgentSystem, `
