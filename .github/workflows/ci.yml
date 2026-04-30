@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  windows-alpha-smoke:
+    name: Windows alpha smoke
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: PowerShell validation
+        shell: pwsh
+        run: .\scripts\Test-AgentSystem.ps1
+
+      - name: Desktop dependencies
+        run: npm ci --prefix apps/desktop
+
+      - name: Desktop build
+        run: npm run build --prefix apps/desktop
+
+      - name: Rust tests
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+      - name: Tauri NSIS alpha bundle
+        run: npm run tauri --prefix apps/desktop -- build --bundles nsis

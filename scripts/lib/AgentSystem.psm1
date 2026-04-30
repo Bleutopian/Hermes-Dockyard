@@ -78,12 +78,46 @@ function Get-AgentSystemConfig {
 }
 
 function Assert-AgentAdministrator {
+    if (-not (Test-AgentAdministrator)) {
+        throw "This action requires an elevated PowerShell session. Run PowerShell as Administrator."
+    }
+}
+
+function Test-AgentAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     $adminRole = [Security.Principal.WindowsBuiltInRole]::Administrator
-    if (-not $principal.IsInRole($adminRole)) {
-        throw "This action requires an elevated PowerShell session. Run PowerShell as Administrator."
+    return $principal.IsInRole($adminRole)
+}
+
+function Test-AgentPathUnderDirectory {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Directory
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath((Expand-AgentPath $Path)).TrimEnd('\', '/')
+    $fullDirectory = [System.IO.Path]::GetFullPath((Expand-AgentPath $Directory)).TrimEnd('\', '/')
+    return ($fullPath.Equals($fullDirectory, [StringComparison]::OrdinalIgnoreCase) -or
+        $fullPath.StartsWith($fullDirectory + [System.IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+        $fullPath.StartsWith($fullDirectory + [System.IO.Path]::AltDirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase))
+}
+
+function Test-AgentProgramRootRequiresElevation {
+    param([Parameter(Mandatory)][string]$ProgramRoot)
+
+    $programFiles = [Environment]::GetFolderPath('ProgramFiles')
+    $programFilesX86 = [Environment]::GetFolderPath('ProgramFilesX86')
+
+    if ($programFiles -and (Test-AgentPathUnderDirectory -Path $ProgramRoot -Directory $programFiles)) {
+        return $true
     }
+
+    if ($programFilesX86 -and (Test-AgentPathUnderDirectory -Path $ProgramRoot -Directory $programFilesX86)) {
+        return $true
+    }
+
+    return $false
 }
 
 function Invoke-AgentNative {
@@ -536,15 +570,37 @@ function Ensure-AgentDirectories {
     New-Item -ItemType Directory -Path (Join-Path $Config.InstallRoot 'logs') -Force | Out-Null
 }
 
-function Copy-AgentProgramFiles {
-    param([Parameter(Mandatory)]$Config)
+function Get-AgentLocalResourceItems {
+    return @('bin', 'config', 'docker', 'docs', 'packaging', 'schemas', 'scripts', 'wsl', 'README.md')
+}
 
-    $sourceRoot = (Resolve-Path -LiteralPath $Config.SourceRoot).Path
-    $programRoot = $Config.ProgramRoot
+function Get-AgentRelativePath {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $rootPath = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not $fullPath.StartsWith($rootPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Path is outside root. Path: $fullPath Root: $rootPath"
+    }
+
+    return $fullPath.Substring($rootPath.Length).Replace('\', '/')
+}
+
+function Copy-AgentResourceSet {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SourceRoot,
+        [Parameter(Mandatory)][string]$TargetRoot
+    )
+
+    $sourceRoot = (Resolve-Path -LiteralPath $SourceRoot).Path
+    $programRoot = $TargetRoot
     New-Item -ItemType Directory -Path $programRoot -Force | Out-Null
 
-    $items = @('bin', 'config', 'docker', 'packaging', 'schemas', 'scripts', 'wsl', 'README.md')
-    foreach ($item in $items) {
+    foreach ($item in (Get-AgentLocalResourceItems)) {
         $source = Join-Path $sourceRoot $item
         if (-not (Test-Path -LiteralPath $source)) {
             continue
@@ -566,6 +622,475 @@ function Copy-AgentProgramFiles {
     $cmd = '@echo off' + [Environment]::NewLine +
         'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0bin\agent-system.ps1" %*' + [Environment]::NewLine
     Set-Content -LiteralPath $cmdPath -Value $cmd -Encoding ASCII
+
+    return (Get-AgentResourceManifestEntries -TargetRoot $programRoot)
+}
+
+function Get-AgentResourceManifestEntries {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$TargetRoot)
+
+    $target = (Resolve-Path -LiteralPath $TargetRoot).Path
+    $entries = Get-ChildItem -LiteralPath $target -Recurse -File |
+        Sort-Object FullName |
+        ForEach-Object {
+            [ordered]@{
+                relative_path = (Get-AgentRelativePath -Root $target -Path $_.FullName)
+                size_bytes    = $_.Length
+                sha256        = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+        }
+
+    return [object[]]$entries
+}
+
+function Copy-AgentProgramFiles {
+    param([Parameter(Mandatory)]$Config)
+
+    Copy-AgentResourceSet -SourceRoot $Config.SourceRoot -TargetRoot $Config.ProgramRoot | Out-Null
+}
+
+function New-AgentOperationEventRecord {
+    param(
+        [Parameter(Mandatory)][string]$OperationName,
+        [Parameter(Mandatory)][string]$Event,
+        [Parameter(Mandatory)][string]$OperationId,
+        [string]$Message,
+        [string]$ErrorCode,
+        [hashtable]$Data
+    )
+
+    $record = [ordered]@{
+        '$schema'      = './schemas/operation.schema.json'
+        schema_version = '1.0'
+        operation      = $OperationName
+        event          = $Event
+        timestamp      = (ConvertTo-AgentIsoTimestamp)
+        operation_id   = $OperationId
+    }
+
+    if ($Message) {
+        $record.message = $Message
+    }
+
+    if ($ErrorCode) {
+        $record.error_code = $ErrorCode
+    }
+
+    if ($Data) {
+        foreach ($key in $Data.Keys) {
+            $record[$key] = $Data[$key]
+        }
+    }
+
+    return [pscustomobject]$record
+}
+
+function Write-AgentOperationEvent {
+    param(
+        [Parameter(Mandatory)]$Record,
+        [ValidateSet('text', 'json')]
+        [string]$OutputFormat = 'text'
+    )
+
+    if ($OutputFormat -eq 'json') {
+        $Record | ConvertTo-Json -Compress -Depth 8
+        return
+    }
+
+    if ($Record.PSObject.Properties['message']) {
+        Write-Host $Record.message
+    }
+}
+
+function Ensure-AgentOperationStore {
+    param([Parameter(Mandatory)]$Config)
+
+    $stateRoot = Join-Path $Config.InstallRoot 'state'
+    $operationRoot = Join-Path $stateRoot 'operations'
+    $logsRoot = Join-Path $Config.InstallRoot 'logs'
+
+    New-Item -ItemType Directory -Path $operationRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $logsRoot -Force | Out-Null
+
+    return [pscustomobject]@{
+        StateRoot     = $stateRoot
+        OperationRoot = $operationRoot
+        LogsRoot      = $logsRoot
+        AuditLogPath  = (Join-Path $logsRoot 'operations.jsonl')
+        ManifestPath  = (Join-Path $stateRoot 'resource-manifest.json')
+    }
+}
+
+function New-AgentOperationPhase {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][int]$Order,
+        [Parameter(Mandatory)][string]$Status,
+        [Parameter(Mandatory)][string]$Kind,
+        [string]$Message
+    )
+
+    return [ordered]@{
+        name        = $Name
+        order       = $Order
+        status      = $Status
+        kind        = $Kind
+        idempotency = 'idempotent'
+        message     = $Message
+        started_at  = (ConvertTo-AgentIsoTimestamp)
+        updated_at  = (ConvertTo-AgentIsoTimestamp)
+    }
+}
+
+function Write-AgentOperationCheckpoint {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Store,
+        [Parameter(Mandatory)][string]$OperationId,
+        [Parameter(Mandatory)][string]$OperationName,
+        [Parameter(Mandatory)][string]$Status,
+        [Parameter(Mandatory)]$Phase,
+        [Parameter(Mandatory)][string]$StartedAt,
+        [Parameter(Mandatory)][bool]$RequiresElevation,
+        [string]$LastErrorCode,
+        [string]$RecoveryDescription,
+        [string]$Caller = 'cli'
+    )
+
+    $checkpointPath = Join-Path $Store.OperationRoot "$OperationId.json"
+    $resumeCommand = ".\bin\agent-system.ps1 $OperationName -OperationId $OperationId -Resume"
+    $record = [ordered]@{
+        '$schema'           = './schemas/checkpoint.schema.json'
+        schema_version      = '1.0'
+        operation_id        = $OperationId
+        operation_name      = $OperationName
+        operation_type      = 'repair'
+        status              = $Status
+        phase               = $Phase
+        started_at          = $StartedAt
+        updated_at          = (ConvertTo-AgentIsoTimestamp)
+        requires_elevation  = $RequiresElevation
+        reboot_required     = $false
+        resume_command      = $resumeCommand
+        last_error_code     = if ($LastErrorCode) { $LastErrorCode } else { $null }
+        recovery_action     = [ordered]@{
+            action      = if ($Status -eq 'completed') { 'retry' } else { 'resume' }
+            description = if ($RecoveryDescription) { $RecoveryDescription } else { 'Rerun the fixed allowlisted repair operation.' }
+            command     = $resumeCommand
+        }
+        caller              = [ordered]@{
+            surface = $Caller
+        }
+        artifacts           = [ordered]@{
+            checkpoint_path       = $checkpointPath
+            audit_log_path        = $Store.AuditLogPath
+            resource_manifest_path = $Store.ManifestPath
+        }
+        notes               = @('repair-local-resources never writes to WSL distro data.')
+    }
+
+    $record | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $checkpointPath -Encoding UTF8
+    return $checkpointPath
+}
+
+function Write-AgentOperationAudit {
+    param(
+        [Parameter(Mandatory)]$Store,
+        [Parameter(Mandatory)][string]$OperationId,
+        [Parameter(Mandatory)][string]$OperationName,
+        [Parameter(Mandatory)][string]$Phase,
+        [Parameter(Mandatory)][string]$Caller,
+        [Parameter(Mandatory)][bool]$RequiresElevation,
+        [Parameter(Mandatory)][string]$Result,
+        [Parameter(Mandatory)][double]$ElapsedMs,
+        [string]$Message,
+        [string]$ErrorCode,
+        [string]$CheckpointPath,
+        [string]$ResourceManifestPath,
+        [string]$TargetRoot
+    )
+
+    $record = [ordered]@{
+        schema_version = '1.0'
+        timestamp      = (ConvertTo-AgentIsoTimestamp)
+        operation_id   = $OperationId
+        operation_name = $OperationName
+        phase          = $Phase
+        caller         = $Caller
+        requires_elevation = $RequiresElevation
+        result         = $Result
+        elapsed_ms     = [math]::Round($ElapsedMs, 2)
+        error_code     = if ($ErrorCode) { $ErrorCode } else { $null }
+    }
+
+    if ($Message) {
+        $record.message = $Message
+    }
+
+    if ($CheckpointPath) {
+        $record.checkpoint_path = $CheckpointPath
+    }
+
+    if ($ResourceManifestPath) {
+        $record.resource_manifest_path = $ResourceManifestPath
+    }
+
+    if ($TargetRoot) {
+        $record.target_root = $TargetRoot
+    }
+
+    Add-Content -LiteralPath $Store.AuditLogPath -Value ($record | ConvertTo-Json -Compress -Depth 8) -Encoding UTF8
+}
+
+function Write-AgentResourceManifest {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Store,
+        [Parameter(Mandatory)][string]$OperationId,
+        [Parameter(Mandatory)]$Entries
+    )
+
+    $metadataPath = Join-Path $Config.SourceRoot 'config\release-metadata.json'
+    $metadata = if (Test-Path -LiteralPath $metadataPath) {
+        Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+    }
+    else {
+        [pscustomobject]@{
+            version        = '0.1.0-alpha.0'
+            channel        = 'internal-alpha'
+            signing_status = 'unsigned-internal-only'
+        }
+    }
+
+    $manifest = [ordered]@{
+        schema_version = '1.0'
+        generated_at   = (ConvertTo-AgentIsoTimestamp)
+        operation_id   = $OperationId
+        source_root    = $Config.SourceRoot
+        program_root   = $Config.ProgramRoot
+        release        = $metadata
+        resources      = [object[]]$Entries
+    }
+
+    $manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Store.ManifestPath -Encoding UTF8
+    return $manifest
+}
+
+function Invoke-AgentSystemResourceRepair {
+    [CmdletBinding()]
+    param(
+        [string]$DistroName,
+        [string]$WslUser,
+        [string]$InstallRoot,
+        [string]$ProgramRoot,
+        [ValidateSet('text', 'json')]
+        [string]$OutputFormat = 'text',
+        [string]$OperationId,
+        [switch]$Resume,
+        [switch]$AllowTestRootOverride,
+        [ValidateSet('cli', 'desktop', 'helper', 'installer', 'scheduled-task')]
+        [string]$Caller = 'cli',
+        [ValidateSet('', 'validate-request', 'snapshot-existing-layout', 'copy-bundled-resources', 'write-resource-manifest', 'verify-target-layout')]
+        [string]$SimulateInterruptAfterPhase = ''
+    )
+
+    $defaultConfig = Get-AgentSystemConfig -DistroName $DistroName -WslUser $WslUser
+    if (-not $AllowTestRootOverride) {
+        if ($InstallRoot -and (-not (Test-AgentPathUnderDirectory -Path $InstallRoot -Directory $defaultConfig.InstallRoot) -or -not (Test-AgentPathUnderDirectory -Path $defaultConfig.InstallRoot -Directory $InstallRoot))) {
+            throw "repair-local-resources uses the fixed InstallRoot from configuration. Test roots require -AllowTestRootOverride."
+        }
+        if ($ProgramRoot -and (-not (Test-AgentPathUnderDirectory -Path $ProgramRoot -Directory $defaultConfig.ProgramRoot) -or -not (Test-AgentPathUnderDirectory -Path $defaultConfig.ProgramRoot -Directory $ProgramRoot))) {
+            throw "repair-local-resources uses the fixed ProgramRoot from configuration. Test roots require -AllowTestRootOverride."
+        }
+    }
+
+    $config = Get-AgentSystemConfig -DistroName $DistroName -WslUser $WslUser -InstallRoot $InstallRoot -ProgramRoot $ProgramRoot
+    $operationName = 'repair-local-resources'
+    if (-not $OperationId) {
+        $OperationId = [guid]::NewGuid().Guid.ToLowerInvariant()
+    }
+    if ($OperationId -notmatch '^[a-z0-9][a-z0-9-]{2,63}$') {
+        throw "Invalid operation id: $OperationId"
+    }
+
+    $store = Ensure-AgentOperationStore -Config $config
+    $checkpointPath = Join-Path $store.OperationRoot "$OperationId.json"
+    $startedAt = ConvertTo-AgentIsoTimestamp
+    $resumeAfterOrder = -1
+    if ($Resume -and (Test-Path -LiteralPath $checkpointPath)) {
+        $existing = Get-Content -LiteralPath $checkpointPath -Raw | ConvertFrom-Json
+        $startedAt = $existing.started_at
+        if ($existing.phase.status -eq 'completed') {
+            $resumeAfterOrder = [int]$existing.phase.order
+        }
+    }
+
+    $requiresElevation = Test-AgentProgramRootRequiresElevation -ProgramRoot $config.ProgramRoot
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $entries = @()
+    $manifest = $null
+
+    Write-AgentOperationEvent -OutputFormat $OutputFormat -Record (New-AgentOperationEventRecord -OperationName $operationName -Event 'operation_started' -OperationId $OperationId -Message "Starting repair-local-resources." -Data @{
+        phase = if ($Resume) { 'resume' } else { 'validate-request' }
+        status = 'running'
+        requires_elevation = $requiresElevation
+        elapsed_ms = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
+    })
+
+    try {
+        $phase = New-AgentOperationPhase -Name 'validate-request' -Order 0 -Status 'running' -Kind 'preflight' -Message 'Checking repair target and privilege boundary.'
+
+        if ($requiresElevation -and -not (Test-AgentAdministrator)) {
+            $phase.status = 'failed'
+            $phase.message = 'Program Files repair requires elevation.'
+            $phase.updated_at = ConvertTo-AgentIsoTimestamp
+            Write-AgentOperationCheckpoint -Config $config -Store $store -OperationId $OperationId -OperationName $operationName -Status 'blocked' -Phase $phase -StartedAt $startedAt -RequiresElevation $requiresElevation -LastErrorCode 'PERMISSION_REQUIRED' -RecoveryDescription 'Rerun the allowlisted repair operation from an elevated PowerShell session.' -Caller $Caller | Out-Null
+            Write-AgentOperationAudit -Store $store -OperationId $OperationId -OperationName $operationName -Phase 'validate-request' -Caller $Caller -RequiresElevation $requiresElevation -Result 'blocked' -ElapsedMs $stopwatch.Elapsed.TotalMilliseconds -Message 'Elevation required.' -ErrorCode 'PERMISSION_REQUIRED' -CheckpointPath $checkpointPath -ResourceManifestPath $store.ManifestPath -TargetRoot $config.ProgramRoot
+            Write-AgentOperationEvent -OutputFormat $OutputFormat -Record (New-AgentOperationEventRecord -OperationName $operationName -Event 'error' -OperationId $OperationId -Message 'Program Files repair requires elevation.' -ErrorCode 'PERMISSION_REQUIRED' -Data @{
+                phase = 'validate-request'
+                status = 'blocked'
+                requires_elevation = $requiresElevation
+                elapsed_ms = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
+            })
+            throw "repair-local-resources requires elevation for ProgramRoot: $($config.ProgramRoot)"
+        }
+
+        if ($resumeAfterOrder -lt 0) {
+            $phase.status = 'completed'
+            $phase.message = 'Repair request is valid.'
+            $phase.updated_at = ConvertTo-AgentIsoTimestamp
+            Write-AgentOperationCheckpoint -Config $config -Store $store -OperationId $OperationId -OperationName $operationName -Status 'running' -Phase $phase -StartedAt $startedAt -RequiresElevation $requiresElevation -Caller $Caller | Out-Null
+            Write-AgentOperationAudit -Store $store -OperationId $OperationId -OperationName $operationName -Phase 'validate-request' -Caller $Caller -RequiresElevation $requiresElevation -Result 'completed' -ElapsedMs $stopwatch.Elapsed.TotalMilliseconds -Message 'Repair request is valid.' -CheckpointPath $checkpointPath -ResourceManifestPath $store.ManifestPath -TargetRoot $config.ProgramRoot
+        }
+
+        if ($SimulateInterruptAfterPhase -eq 'validate-request') {
+            throw "Simulated interruption after phase validate-request for operation $OperationId."
+        }
+
+        if ($resumeAfterOrder -lt 1) {
+            $phase = New-AgentOperationPhase -Name 'snapshot-existing-layout' -Order 1 -Status 'completed' -Kind 'preflight' -Message 'Captured current target inventory for audit.'
+            Write-AgentOperationCheckpoint -Config $config -Store $store -OperationId $OperationId -OperationName $operationName -Status 'running' -Phase $phase -StartedAt $startedAt -RequiresElevation $requiresElevation -Caller $Caller | Out-Null
+            $existingCount = if (Test-Path -LiteralPath $config.ProgramRoot) { @(Get-ChildItem -LiteralPath $config.ProgramRoot -Recurse -File -ErrorAction SilentlyContinue).Count } else { 0 }
+            Write-AgentOperationAudit -Store $store -OperationId $OperationId -OperationName $operationName -Phase 'snapshot-existing-layout' -Caller $Caller -RequiresElevation $requiresElevation -Result 'completed' -ElapsedMs $stopwatch.Elapsed.TotalMilliseconds -Message ("Captured {0} existing files." -f $existingCount) -CheckpointPath $checkpointPath -ResourceManifestPath $store.ManifestPath -TargetRoot $config.ProgramRoot
+        }
+
+        if ($SimulateInterruptAfterPhase -eq 'snapshot-existing-layout') {
+            throw "Simulated interruption after phase snapshot-existing-layout for operation $OperationId."
+        }
+
+        if ($resumeAfterOrder -lt 2) {
+            $phase = New-AgentOperationPhase -Name 'copy-bundled-resources' -Order 2 -Status 'running' -Kind 'copy' -Message 'Copying bundled local resources into ProgramRoot.'
+            Write-AgentOperationCheckpoint -Config $config -Store $store -OperationId $OperationId -OperationName $operationName -Status 'running' -Phase $phase -StartedAt $startedAt -RequiresElevation $requiresElevation -Caller $Caller | Out-Null
+            $entries = Copy-AgentResourceSet -SourceRoot $config.SourceRoot -TargetRoot $config.ProgramRoot
+            $phase.status = 'completed'
+            $phase.message = ("Copied {0} local resources." -f $entries.Count)
+            $phase.updated_at = ConvertTo-AgentIsoTimestamp
+            Write-AgentOperationCheckpoint -Config $config -Store $store -OperationId $OperationId -OperationName $operationName -Status 'running' -Phase $phase -StartedAt $startedAt -RequiresElevation $requiresElevation -Caller $Caller | Out-Null
+            Write-AgentOperationAudit -Store $store -OperationId $OperationId -OperationName $operationName -Phase 'copy-bundled-resources' -Caller $Caller -RequiresElevation $requiresElevation -Result 'completed' -ElapsedMs $stopwatch.Elapsed.TotalMilliseconds -Message ("Copied {0} resources." -f $entries.Count) -CheckpointPath $checkpointPath -ResourceManifestPath $store.ManifestPath -TargetRoot $config.ProgramRoot
+            Write-AgentOperationEvent -OutputFormat $OutputFormat -Record (New-AgentOperationEventRecord -OperationName $operationName -Event 'progress' -OperationId $OperationId -Message ("Copied {0} local resources." -f $entries.Count) -Data @{
+                phase = 'copy-bundled-resources'
+                status = 'completed'
+                requires_elevation = $requiresElevation
+                elapsed_ms = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
+            })
+        }
+        else {
+            $entries = Get-AgentResourceManifestEntries -TargetRoot $config.ProgramRoot
+            Write-AgentOperationEvent -OutputFormat $OutputFormat -Record (New-AgentOperationEventRecord -OperationName $operationName -Event 'progress' -OperationId $OperationId -Message 'Resuming after completed copy-bundled-resources phase.' -Data @{
+                phase = 'copy-bundled-resources'
+                status = 'skipped'
+                requires_elevation = $requiresElevation
+                elapsed_ms = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
+            })
+        }
+
+        if ($SimulateInterruptAfterPhase -eq 'copy-bundled-resources') {
+            throw "Simulated interruption after phase copy-bundled-resources for operation $OperationId."
+        }
+
+        if ($resumeAfterOrder -lt 3 -or -not (Test-Path -LiteralPath $store.ManifestPath)) {
+            $phase = New-AgentOperationPhase -Name 'write-resource-manifest' -Order 3 -Status 'running' -Kind 'configure' -Message 'Writing deterministic resource manifest.'
+            Write-AgentOperationCheckpoint -Config $config -Store $store -OperationId $OperationId -OperationName $operationName -Status 'running' -Phase $phase -StartedAt $startedAt -RequiresElevation $requiresElevation -Caller $Caller | Out-Null
+            if ($entries.Count -eq 0 -and (Test-Path -LiteralPath $config.ProgramRoot)) {
+                $entries = Get-AgentResourceManifestEntries -TargetRoot $config.ProgramRoot
+            }
+            $manifest = Write-AgentResourceManifest -Config $config -Store $store -OperationId $OperationId -Entries $entries
+            $phase.status = 'completed'
+            $phase.message = 'Resource manifest written.'
+            $phase.updated_at = ConvertTo-AgentIsoTimestamp
+            Write-AgentOperationCheckpoint -Config $config -Store $store -OperationId $OperationId -OperationName $operationName -Status 'running' -Phase $phase -StartedAt $startedAt -RequiresElevation $requiresElevation -Caller $Caller | Out-Null
+            Write-AgentOperationAudit -Store $store -OperationId $OperationId -OperationName $operationName -Phase 'write-resource-manifest' -Caller $Caller -RequiresElevation $requiresElevation -Result 'completed' -ElapsedMs $stopwatch.Elapsed.TotalMilliseconds -Message 'Resource manifest written.' -CheckpointPath $checkpointPath -ResourceManifestPath $store.ManifestPath -TargetRoot $config.ProgramRoot
+            Write-AgentOperationEvent -OutputFormat $OutputFormat -Record (New-AgentOperationEventRecord -OperationName $operationName -Event 'progress' -OperationId $OperationId -Message 'Resource manifest written.' -Data @{
+                phase = 'write-resource-manifest'
+                status = 'completed'
+                requires_elevation = $requiresElevation
+                elapsed_ms = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
+            })
+        }
+        else {
+            $manifest = Get-Content -LiteralPath $store.ManifestPath -Raw | ConvertFrom-Json
+        }
+
+        if ($SimulateInterruptAfterPhase -eq 'write-resource-manifest') {
+            throw "Simulated interruption after phase write-resource-manifest for operation $OperationId."
+        }
+
+        $phase = New-AgentOperationPhase -Name 'verify-target-layout' -Order 4 -Status 'completed' -Kind 'verify' -Message 'Target files match the resource manifest.'
+        $manifestEntries = @($manifest.resources)
+        foreach ($entry in $manifestEntries) {
+            $targetPath = Join-Path $config.ProgramRoot ($entry.relative_path -replace '/', '\')
+            if (-not (Test-Path -LiteralPath $targetPath)) {
+                throw "Manifest entry is missing from ProgramRoot: $($entry.relative_path)"
+            }
+            $hash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne $entry.sha256) {
+                throw "Manifest hash mismatch for ProgramRoot entry: $($entry.relative_path)"
+            }
+        }
+        Write-AgentOperationCheckpoint -Config $config -Store $store -OperationId $OperationId -OperationName $operationName -Status 'completed' -Phase $phase -StartedAt $startedAt -RequiresElevation $requiresElevation -Caller $Caller | Out-Null
+        Write-AgentOperationAudit -Store $store -OperationId $OperationId -OperationName $operationName -Phase 'verify-target-layout' -Caller $Caller -RequiresElevation $requiresElevation -Result 'completed' -ElapsedMs $stopwatch.Elapsed.TotalMilliseconds -Message 'Target files match resource manifest.' -CheckpointPath $checkpointPath -ResourceManifestPath $store.ManifestPath -TargetRoot $config.ProgramRoot
+
+        if ($SimulateInterruptAfterPhase -eq 'verify-target-layout') {
+            throw "Simulated interruption after phase verify-target-layout for operation $OperationId."
+        }
+
+        $phase = New-AgentOperationPhase -Name 'finalize-operation' -Order 5 -Status 'completed' -Kind 'cleanup' -Message 'Local resources repaired.'
+        Write-AgentOperationCheckpoint -Config $config -Store $store -OperationId $OperationId -OperationName $operationName -Status 'completed' -Phase $phase -StartedAt $startedAt -RequiresElevation $requiresElevation -Caller $Caller | Out-Null
+        Write-AgentOperationAudit -Store $store -OperationId $OperationId -OperationName $operationName -Phase 'finalize-operation' -Caller $Caller -RequiresElevation $requiresElevation -Result 'completed' -ElapsedMs $stopwatch.Elapsed.TotalMilliseconds -Message 'repair-local-resources completed.' -CheckpointPath $checkpointPath -ResourceManifestPath $store.ManifestPath -TargetRoot $config.ProgramRoot
+
+        Write-AgentOperationEvent -OutputFormat $OutputFormat -Record (New-AgentOperationEventRecord -OperationName $operationName -Event 'operation_completed' -OperationId $OperationId -Message 'repair-local-resources completed.' -Data @{
+            checkpoint_path = $checkpointPath
+            audit_log_path = $store.AuditLogPath
+            resource_manifest_path = $store.ManifestPath
+            copied_resources = $manifest.resources.Count
+            phase = 'finalize-operation'
+            status = 'completed'
+            requires_elevation = $requiresElevation
+            elapsed_ms = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
+        })
+    }
+    catch {
+        if ($_.Exception.Message -notmatch 'requires elevation') {
+            $errorCode = if ($_.Exception.Message -match '^Simulated interruption') { 'OPERATION_INTERRUPTED' } else { 'RESOURCE_REPAIR_FAILED' }
+            $phase = if (Test-Path -LiteralPath $checkpointPath) {
+                (Get-Content -LiteralPath $checkpointPath -Raw | ConvertFrom-Json).phase
+            }
+            else {
+                New-AgentOperationPhase -Name 'validate-request' -Order 0 -Status 'failed' -Kind 'preflight' -Message $_.Exception.Message
+            }
+            Write-AgentOperationCheckpoint -Config $config -Store $store -OperationId $OperationId -OperationName $operationName -Status 'failed' -Phase $phase -StartedAt $startedAt -RequiresElevation $requiresElevation -LastErrorCode $errorCode -RecoveryDescription 'Resume the allowlisted repair operation with the same operation id.' -Caller $Caller | Out-Null
+            Write-AgentOperationAudit -Store $store -OperationId $OperationId -OperationName $operationName -Phase $phase.name -Caller $Caller -RequiresElevation $requiresElevation -Result 'failed' -ElapsedMs $stopwatch.Elapsed.TotalMilliseconds -Message $_.Exception.Message -ErrorCode $errorCode -CheckpointPath $checkpointPath -ResourceManifestPath $store.ManifestPath -TargetRoot $config.ProgramRoot
+            Write-AgentOperationEvent -OutputFormat $OutputFormat -Record (New-AgentOperationEventRecord -OperationName $operationName -Event 'error' -OperationId $OperationId -Message $_.Exception.Message -ErrorCode $errorCode -Data @{
+                phase = $phase.name
+                status = 'failed'
+                requires_elevation = $requiresElevation
+                elapsed_ms = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
+            })
+        }
+
+        throw
+    }
 }
 
 function Ensure-AgentWslFeature {
@@ -1033,7 +1558,7 @@ function Build-AgentSystemPackage {
         Remove-Item -LiteralPath $OutputPath -Force
     }
 
-    $include = @('bin', 'config', 'docker', 'packaging', 'schemas', 'scripts', 'wsl', 'README.md')
+    $include = Get-AgentLocalResourceItems
     $temp = Join-Path $env:TEMP ("AgentSystem-Package-" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $temp -Force | Out-Null
 
@@ -1063,8 +1588,10 @@ function Test-AgentSystemProject {
     $required = @(
         'README.md',
         'config\agent-system.json',
+        'config\release-metadata.json',
         'bin\agent-system.ps1',
         'schemas\operation.schema.json',
+        'schemas\checkpoint.schema.json',
         'scripts\lib\AgentSystem.psm1',
         'wsl\bootstrap-ubuntu.sh',
         'docker\docker-compose.yml',
@@ -1105,6 +1632,7 @@ Export-ModuleMember -Function `
     Invoke-AgentSystemPreflight, `
     Get-AgentSystemLogs, `
     Invoke-HermesSetup, `
+    Invoke-AgentSystemResourceRepair, `
     Uninstall-AgentSystem, `
     Build-AgentSystemPackage, `
     Test-AgentSystemProject

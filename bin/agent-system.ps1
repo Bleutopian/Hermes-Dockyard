@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('install', 'update', 'status', 'preflight', 'start', 'stop', 'logs', 'hermes-setup', 'uninstall', 'package')]
+    [ValidateSet('install', 'update', 'status', 'preflight', 'repair-local-resources', 'start', 'stop', 'logs', 'hermes-setup', 'uninstall', 'package')]
     [string]$Action = 'status',
 
     [string]$DistroName,
@@ -10,6 +10,11 @@ param(
     [string]$ProgramRoot,
     [string]$ClawPanelAssetUrl,
     [string]$PackageOutput,
+    [string]$OperationId,
+    [ValidateSet('', 'validate-request', 'snapshot-existing-layout', 'copy-bundled-resources', 'write-resource-manifest', 'verify-target-layout')]
+    [string]$SimulateInterruptAfterPhase = '',
+    [ValidateSet('cli', 'desktop', 'helper', 'installer', 'scheduled-task')]
+    [string]$Caller = 'cli',
 
     [switch]$SkipClawPanel,
     [switch]$SkipDocker,
@@ -19,6 +24,8 @@ param(
     [switch]$RemoveProgramFiles,
     [switch]$RemoveClawPanelData,
     [switch]$Force,
+    [switch]$Resume,
+    [switch]$AllowTestRootOverride,
 
     [ValidateSet('text', 'json')]
     [string]$OutputFormat = 'text'
@@ -182,6 +189,15 @@ switch ($Action) {
     }
     'preflight' {
         Invoke-AgentSystemPreflight @common -OutputFormat $OutputFormat
+    }
+    'repair-local-resources' {
+        Invoke-AgentSystemResourceRepair @common `
+            -OutputFormat $OutputFormat `
+            -OperationId $OperationId `
+            -Resume:$Resume `
+            -AllowTestRootOverride:$AllowTestRootOverride `
+            -Caller $Caller `
+            -SimulateInterruptAfterPhase $SimulateInterruptAfterPhase
     }
     'start' {
         Invoke-AgentCliAction -ActionName 'start' -Script {

@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "product": "Hermes Dockyard",
+  "version": "0.1.0-alpha.1",
+  "channel": "internal-alpha",
+  "scripts_version": "0.1.0",
+  "payload_version": "0.1.0",
+  "desktop_version": "0.1.0",
+  "signed": false,
+  "signing_status": "unsigned-internal-only",
+  "public_release_allowed": false,
+  "public_release_blockers": [
+    "code-signing",
+    "clean-vm-install-validation",
+    "privileged-helper-hardening"
+  ],
+  "support_note": "Internal alpha only. Windows SmartScreen warnings are expected until code signing is configured."
+}

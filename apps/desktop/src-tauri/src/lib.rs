@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -19,7 +20,7 @@ struct BackendProbe {
 }
 
 #[tauri::command]
-fn probe_backend_action(action: &str) -> BackendProbe {
+fn probe_backend_action(app: AppHandle, action: &str) -> BackendProbe {
     if !is_supported_backend_action(action) {
         return BackendProbe {
             action: action.to_string(),
@@ -33,7 +34,7 @@ fn probe_backend_action(action: &str) -> BackendProbe {
         };
     }
 
-    let Some(script_path) = find_backend_script() else {
+    let Some(script_path) = find_backend_script(Some(&app)) else {
         return BackendProbe {
             action: action.to_string(),
             available: false,
@@ -106,7 +107,27 @@ fn string_or_none(bytes: &[u8]) -> Option<String> {
     }
 }
 
-fn find_backend_script() -> Option<PathBuf> {
+fn find_backend_script(app: Option<&AppHandle>) -> Option<PathBuf> {
+    if let Ok(path) = env::var("HERMES_DOCKYARD_BACKEND_SCRIPT") {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    if let Some(handle) = app {
+        if let Ok(resource_dir) = handle.path().resource_dir() {
+            let resource_candidates = [
+                resource_dir.join("resources").join("bin").join("agent-system.ps1"),
+                resource_dir.join("bin").join("agent-system.ps1"),
+            ];
+
+            if let Some(candidate) = resource_candidates.into_iter().find(|path| path.exists()) {
+                return Some(candidate);
+            }
+        }
+    }
+
     let candidates = [
         env::var("CARGO_MANIFEST_DIR").ok().map(PathBuf::from),
         env::current_dir().ok(),
@@ -150,7 +171,7 @@ mod tests {
 
     #[test]
     fn source_tree_probe_can_find_backend_script() {
-        let script = find_backend_script().expect("expected to locate bin/agent-system.ps1");
+        let script = find_backend_script(None).expect("expected to locate bin/agent-system.ps1");
         assert!(script.ends_with("bin\\agent-system.ps1") || script.ends_with("bin/agent-system.ps1"));
     }
 }

@@ -7,3 +7,5 @@ Import-Module (Join-Path $repoRoot 'scripts\lib\AgentSystem.psm1') -Force -Disab
 
 Test-AgentSystemProject
 & (Join-Path $repoRoot 'tests\powershell\Test-AgentSystemJson.ps1')
+& (Join-Path $repoRoot 'tests\powershell\Test-AgentSystemInitialLanes.ps1')
+& (Join-Path $repoRoot 'tests\powershell\Test-AgentSystemRepairProof.ps1')

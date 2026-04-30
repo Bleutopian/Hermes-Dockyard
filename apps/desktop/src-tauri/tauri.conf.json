@@ -26,13 +26,39 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "nsis"
+    ],
+    "publisher": "Bleutopian",
+    "copyright": "Copyright 2026 Bleutopian. Internal alpha.",
+    "shortDescription": "Hermes Dockyard internal alpha desktop shell.",
+    "longDescription": "Internal unsigned alpha for validating Hermes Dockyard desktop packaging, bundled resources, read-only backend checks, and the repair-local-resources proof.",
+    "resources": {
+      "../../../bin": "resources/bin",
+      "../../../config": "resources/config",
+      "../../../docker": "resources/docker",
+      "../../../packaging": "resources/packaging",
+      "../../../schemas": "resources/schemas",
+      "../../../scripts": "resources/scripts",
+      "../../../wsl": "resources/wsl",
+      "../../../README.md": "resources/README.md"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false,
+        "languages": [
+          "English"
+        ],
+        "startMenuFolder": "Hermes Dockyard"
+      }
+    }
   }
 }

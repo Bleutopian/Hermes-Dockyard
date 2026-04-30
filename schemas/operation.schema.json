@@ -21,7 +21,9 @@
         "CLAWPANEL_ASSET_MISSING",
         "NETWORK_UNAVAILABLE",
         "PAYLOAD_NOT_INSTALLED",
-        "PERMISSION_REQUIRED"
+        "PERMISSION_REQUIRED",
+        "OPERATION_INTERRUPTED",
+        "RESOURCE_REPAIR_FAILED"
       ]
     },
     "eventType": {
