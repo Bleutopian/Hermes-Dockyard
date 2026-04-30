@@ -272,10 +272,12 @@ function Get-AgentSystemProbeState {
         }
 
         $user = ConvertTo-AgentBashSingleQuoted $Config.WslUser
-        $hermesCheck = "sudo -H -u $user bash -lc 'export PATH=`"$HOME/.local/bin:$PATH`"; command -v hermes >/dev/null 2>&1'"
+        $hermesInnerCheck = 'export PATH="$HOME/.local/bin:$PATH"; command -v hermes >/dev/null 2>&1'
+        $hermesCheck = "sudo -H -u $user bash -lc $(ConvertTo-AgentBashSingleQuoted $hermesInnerCheck)"
         $hermesInstalled = Test-AgentWslCommand -DistroName $Config.DistroName -Command $hermesCheck
         if ($hermesInstalled) {
-            $gatewayCheck = "sudo -H -u $user bash -lc 'tmux has-session -t ''hermes-gateway'' 2>/dev/null'"
+            $gatewayInnerCheck = "tmux has-session -t 'hermes-gateway' 2>/dev/null"
+            $gatewayCheck = "sudo -H -u $user bash -lc $(ConvertTo-AgentBashSingleQuoted $gatewayInnerCheck)"
             $hermesGatewayRunning = Test-AgentWslCommand -DistroName $Config.DistroName -Command $gatewayCheck
         }
     }
@@ -404,8 +406,8 @@ function Get-AgentSystemStatusRecord {
         }
     }
 
-    $uniqueErrorCodes = @($errorCodes | Select-Object -Unique)
-    $checkRecords = @($checks)
+    $uniqueErrorCodes = [object[]]($errorCodes.ToArray() | Select-Object -Unique)
+    $checkRecords = [object[]]$checks.ToArray()
 
     return [ordered]@{
         '$schema'       = './schemas/operation.schema.json'
@@ -475,6 +477,8 @@ function Get-AgentSystemPreflightRecord {
         })
     }
 
+    $recommendedActionRecords = [object[]]$recommendedActions.ToArray()
+
     return [ordered]@{
         '$schema'            = './schemas/operation.schema.json'
         schema_version       = '1.0'
@@ -488,7 +492,7 @@ function Get-AgentSystemPreflightRecord {
             install          = $true
             start            = ($statusRecord.state -ne 'blocked')
         }
-        recommended_actions  = @($recommendedActions)
+        recommended_actions  = $recommendedActionRecords
         error_codes          = $statusRecord.error_codes
         config               = $statusRecord.config
         environment          = $statusRecord.environment
