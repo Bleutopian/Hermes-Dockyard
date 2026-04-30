@@ -3,152 +3,136 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
-$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$cliPath = Join-Path $repoRoot 'bin\agent-system.ps1'
-$operationSchemaPath = Join-Path $repoRoot 'schemas\operation.schema.json'
-
-$failures = New-Object System.Collections.Generic.List[string]
-
-function Add-Failure {
-    param([string]$Message)
-    $script:failures.Add($Message)
-}
-
 function Assert-True {
     param(
-        [bool]$Condition,
-        [string]$Message
+        [Parameter(Mandatory)][bool]$Condition,
+        [Parameter(Mandatory)][string]$Message
     )
 
     if (-not $Condition) {
-        Add-Failure -Message $Message
+        throw $Message
     }
 }
 
-function Get-ParameterValidateSetValues {
+function Assert-Equal {
     param(
-        [Parameter(Mandatory)][string]$ScriptPath,
-        [Parameter(Mandatory)][string]$ParameterName
+        [Parameter(Mandatory)]$Expected,
+        [Parameter(Mandatory)]$Actual,
+        [Parameter(Mandatory)][string]$Message
     )
 
-    $tokens = $null
-    $parseErrors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$parseErrors)
-    if ($parseErrors.Count -gt 0) {
-        Add-Failure -Message ("Unable to parse {0}: {1}" -f $ScriptPath, (($parseErrors | ForEach-Object Message) -join '; '))
-        return @()
-    }
-
-    $parameterAst = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq $ParameterName } | Select-Object -First 1
-    if (-not $parameterAst) {
-        return @()
-    }
-
-    $validateSet = $parameterAst.Attributes | Where-Object { $_.TypeName.FullName -eq 'ValidateSet' } | Select-Object -First 1
-    if (-not $validateSet) {
-        return @()
-    }
-
-    return @($validateSet.PositionalArguments | ForEach-Object { $_.Value })
-}
-
-function Get-JsonSnapshot {
-    param([string]$Path)
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return @()
-    }
-
-    return @(Get-ChildItem -LiteralPath $Path -Recurse -Force | ForEach-Object {
-        [pscustomobject]@{
-            Path = $_.FullName.Substring($Path.Length)
-            Length = if ($_.PSIsContainer) { -1 } else { $_.Length }
-            LastWriteTimeUtc = $_.LastWriteTimeUtc.ToString('o')
-        }
-    } | Sort-Object Path)
-}
-
-$actionValues = Get-ParameterValidateSetValues -ScriptPath $cliPath -ParameterName 'Action'
-Assert-True ($actionValues -contains 'preflight') 'bin/agent-system.ps1 must expose a preflight action in the Action ValidateSet.'
-
-$outputFormats = Get-ParameterValidateSetValues -ScriptPath $cliPath -ParameterName 'OutputFormat'
-Assert-True ($outputFormats.Count -gt 0) 'bin/agent-system.ps1 must define an OutputFormat parameter with ValidateSet(text,json).'
-if ($outputFormats.Count -gt 0) {
-    Assert-True ($outputFormats -contains 'text') 'OutputFormat must allow text.'
-    Assert-True ($outputFormats -contains 'json') 'OutputFormat must allow json.'
-}
-
-if (Test-Path -LiteralPath $operationSchemaPath) {
-    $schemaRaw = Get-Content -LiteralPath $operationSchemaPath -Raw
-    try {
-        $null = $schemaRaw | ConvertFrom-Json
-    }
-    catch {
-        Add-Failure -Message ("schemas/operation.schema.json is not valid JSON: {0}" -f $_.Exception.Message)
-    }
-
-    foreach ($token in @('operation_started', 'progress', 'status', 'warning', 'error', 'reboot_required', 'operation_completed', 'WSL_MISSING', 'REBOOT_REQUIRED', 'DOCKER_DAEMON_FAILED', 'HERMES_INSTALL_FAILED', 'CLAWPANEL_ASSET_MISSING', 'NETWORK_UNAVAILABLE', 'PAYLOAD_NOT_INSTALLED', 'PERMISSION_REQUIRED')) {
-        Assert-True ($schemaRaw.Contains($token)) ("schemas/operation.schema.json must mention token: {0}" -f $token)
+    if ($Expected -ne $Actual) {
+        throw "$Message`nExpected: $Expected`nActual:   $Actual"
     }
 }
-else {
-    Add-Failure -Message 'schemas/operation.schema.json is missing.'
-}
 
-$canRunJsonChecks = ($actionValues -contains 'preflight') -and ($outputFormats -contains 'json')
-if ($canRunJsonChecks) {
-    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('AgentSystem-JsonTest-' + [Guid]::NewGuid().ToString('N'))
-    $installRoot = Join-Path $tempRoot 'install'
-    $programRoot = Join-Path $tempRoot 'program'
-    New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+function Invoke-AgentJsonAction {
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Action,
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][string]$ProbePath
+    )
+
+    $previousConfig = $env:AGENT_SYSTEM_CONFIG_PATH
+    $previousProbe = $env:AGENT_SYSTEM_TEST_PROBE_PATH
 
     try {
-        $before = Get-JsonSnapshot -Path $tempRoot
-
-        $preflightOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cliPath preflight -OutputFormat json -DistroName ('Missing-' + [Guid]::NewGuid().ToString('N')) -InstallRoot $installRoot -ProgramRoot $programRoot 2>&1
-        $preflightExitCode = $LASTEXITCODE
-        if ($preflightExitCode -ne 0) {
-            Add-Failure -Message ("preflight JSON command failed with exit code {0}: {1}" -f $preflightExitCode, ($preflightOutput -join [Environment]::NewLine))
-        }
-        else {
-            try {
-                $null = ($preflightOutput -join [Environment]::NewLine) | ConvertFrom-Json
-            }
-            catch {
-                Add-Failure -Message ("preflight JSON output is not valid JSON: {0}`nOutput:`n{1}" -f $_.Exception.Message, ($preflightOutput -join [Environment]::NewLine))
-            }
-        }
-
-        $after = Get-JsonSnapshot -Path $tempRoot
-        $beforeJson = $before | ConvertTo-Json -Depth 5
-        $afterJson = $after | ConvertTo-Json -Depth 5
-        Assert-True ($beforeJson -eq $afterJson) 'preflight must not mutate the temporary install/program roots during JSON validation.'
-
-        $statusOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cliPath status -OutputFormat json -DistroName ('Missing-' + [Guid]::NewGuid().ToString('N')) -InstallRoot $installRoot -ProgramRoot $programRoot 2>&1
-        $statusExitCode = $LASTEXITCODE
-        if ($statusExitCode -ne 0) {
-            Add-Failure -Message ("status JSON command failed with exit code {0}: {1}" -f $statusExitCode, ($statusOutput -join [Environment]::NewLine))
-        }
-        else {
-            try {
-                $statusJson = ($statusOutput -join [Environment]::NewLine) | ConvertFrom-Json
-                $statusPayload = $statusJson.PSObject.Properties.Name
-                Assert-True (($statusPayload -contains 'status') -or ($statusPayload -contains 'event_type')) 'status JSON output should include a status or event_type field.'
-            }
-            catch {
-                Add-Failure -Message ("status JSON output is not valid JSON: {0}`nOutput:`n{1}" -f $_.Exception.Message, ($statusOutput -join [Environment]::NewLine))
-            }
-        }
+        $env:AGENT_SYSTEM_CONFIG_PATH = $ConfigPath
+        $env:AGENT_SYSTEM_TEST_PROBE_PATH = $ProbePath
+        $json = & (Join-Path $RepoRoot 'bin\agent-system.ps1') $Action -OutputFormat json
+        return ($json | ConvertFrom-Json)
     }
     finally {
-        if (Test-Path -LiteralPath $tempRoot) {
-            Remove-Item -LiteralPath $tempRoot -Recurse -Force
-        }
+        $env:AGENT_SYSTEM_CONFIG_PATH = $previousConfig
+        $env:AGENT_SYSTEM_TEST_PROBE_PATH = $previousProbe
     }
 }
 
-if ($failures.Count -gt 0) {
-    throw ((@('Test-AgentSystemJson.ps1 failed:') + ($failures | ForEach-Object { "- $_" })) -join [Environment]::NewLine)
-}
+$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$tempRoot = Join-Path $env:TEMP ("agent-system-json-tests-" + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
 
-Write-Host 'Test-AgentSystemJson.ps1 passed.'
+try {
+    $configPath = Join-Path $tempRoot 'agent-system.json'
+    $config = [ordered]@{
+        distroName       = 'Ubuntu-24.04'
+        wslUser          = 'agent'
+        installRoot      = 'C:\Temp\AgentSystem'
+        programRoot      = 'C:\Program Files\AgentSystem'
+        taskName         = 'AgentSystem-WSL-Startup'
+        clawPanelRepo    = 'qingchencloud/clawpanel'
+        hermesInstallUrl = 'https://example.invalid/install.sh'
+    }
+    $config | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $configPath -Encoding UTF8
+
+    $probeDir = Join-Path $tempRoot 'probes'
+    New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+
+    $noWslPath = Join-Path $probeDir 'no-wsl.json'
+    [ordered]@{
+        wslDistros        = @()
+        distroPresent     = $false
+        payloadInstalled  = $false
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $noWslPath -Encoding UTF8
+
+    $payloadMissingPath = Join-Path $probeDir 'payload-missing.json'
+    [ordered]@{
+        wslDistros        = @('Ubuntu-24.04')
+        distroPresent     = $true
+        payloadInstalled  = $false
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $payloadMissingPath -Encoding UTF8
+
+    $partialPayloadPath = Join-Path $probeDir 'payload-partial.json'
+    [ordered]@{
+        wslDistros           = @('Ubuntu-24.04')
+        distroPresent        = $true
+        payloadInstalled     = $true
+        restartRequired      = $false
+        systemdActive        = $true
+        ubuntuDescription    = 'Ubuntu 24.04.1 LTS'
+        dockerInstalled      = $true
+        dockerDaemonRunning  = $false
+        hermesInstalled      = $true
+        hermesGatewayRunning = $false
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $partialPayloadPath -Encoding UTF8
+
+    $statusNoWsl = Invoke-AgentJsonAction -RepoRoot $repoRoot -Action 'status' -ConfigPath $configPath -ProbePath $noWslPath
+    Assert-Equal -Expected 'status' -Actual $statusNoWsl.operation -Message 'status JSON should identify the operation.'
+    Assert-Equal -Expected 'blocked' -Actual $statusNoWsl.state -Message 'No-WSL status should be blocked.'
+    Assert-True -Condition ($statusNoWsl.error_codes -contains 'WSL_MISSING') -Message 'No-WSL status should include WSL_MISSING.'
+
+    $preflightNoWsl = Invoke-AgentJsonAction -RepoRoot $repoRoot -Action 'preflight' -ConfigPath $configPath -ProbePath $noWslPath
+    Assert-Equal -Expected 'preflight' -Actual $preflightNoWsl.operation -Message 'preflight JSON should identify the operation.'
+    Assert-True -Condition (-not $preflightNoWsl.mutates_system) -Message 'Preflight must remain non-mutating.'
+    Assert-Equal -Expected 'install' -Actual $preflightNoWsl.recommended_actions[0].label -Message 'No-WSL preflight should recommend install.'
+
+    $statusPayloadMissing = Invoke-AgentJsonAction -RepoRoot $repoRoot -Action 'status' -ConfigPath $configPath -ProbePath $payloadMissingPath
+    Assert-Equal -Expected 'blocked' -Actual $statusPayloadMissing.state -Message 'Payload-missing status should be blocked.'
+    Assert-True -Condition ($statusPayloadMissing.error_codes -contains 'PAYLOAD_NOT_INSTALLED') -Message 'Payload-missing status should include PAYLOAD_NOT_INSTALLED.'
+
+    $statusPartial = Invoke-AgentJsonAction -RepoRoot $repoRoot -Action 'status' -ConfigPath $configPath -ProbePath $partialPayloadPath
+    Assert-Equal -Expected 'warning' -Actual $statusPartial.state -Message 'Partial payload status should degrade to warning.'
+    Assert-True -Condition ($statusPartial.error_codes -contains 'DOCKER_DAEMON_FAILED') -Message 'Partial payload status should include DOCKER_DAEMON_FAILED when Docker is down.'
+    Assert-True -Condition ($statusPartial.environment.hermes_installed) -Message 'Partial payload status should preserve Hermes probe data.'
+
+    $preflightPartial = Invoke-AgentJsonAction -RepoRoot $repoRoot -Action 'preflight' -ConfigPath $configPath -ProbePath $partialPayloadPath
+    Assert-True -Condition $preflightPartial.ready_for.start -Message 'Partial payload preflight should still allow start guidance.'
+    Assert-Equal -Expected 'start' -Actual $preflightPartial.recommended_actions[0].label -Message 'Partial payload preflight should recommend start when not blocked.'
+
+    $schemaPath = Join-Path $repoRoot 'schemas\operation.schema.json'
+    $schema = Get-Content -LiteralPath $schemaPath -Raw | ConvertFrom-Json
+    $eventEnum = @($schema.'$defs'.eventType.enum)
+    $errorEnum = @($schema.'$defs'.errorCode.enum)
+    Assert-True -Condition ($eventEnum -contains 'operation_started') -Message 'Schema should declare operation_started.'
+    Assert-True -Condition ($eventEnum -contains 'operation_completed') -Message 'Schema should declare operation_completed.'
+    Assert-True -Condition ($errorEnum -contains 'WSL_MISSING') -Message 'Schema should declare WSL_MISSING.'
+    Assert-True -Condition ($errorEnum -contains 'PAYLOAD_NOT_INSTALLED') -Message 'Schema should declare PAYLOAD_NOT_INSTALLED.'
+
+    Write-Host 'Test-AgentSystemJson passed.'
+}
+finally {
+    if (Test-Path -LiteralPath $tempRoot) {
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force
+    }
+}

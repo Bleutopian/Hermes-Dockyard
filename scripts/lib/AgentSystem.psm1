@@ -317,7 +317,7 @@ function New-AgentSystemCheck {
         $record.details = $Details
     }
 
-    return [pscustomobject]$record
+    return $record
 }
 
 function Get-AgentSystemStatusRecord {
@@ -404,14 +404,17 @@ function Get-AgentSystemStatusRecord {
         }
     }
 
-    return [pscustomobject][ordered]@{
+    $uniqueErrorCodes = @($errorCodes | Select-Object -Unique)
+    $checkRecords = @($checks)
+
+    return [ordered]@{
         '$schema'       = './schemas/operation.schema.json'
         schema_version  = '1.0'
         operation       = 'status'
-        generated_at    = ConvertTo-AgentIsoTimestamp
+        generated_at    = (ConvertTo-AgentIsoTimestamp)
         state           = $state
         summary         = $summary
-        error_codes     = @($errorCodes | Select-Object -Unique)
+        error_codes     = $uniqueErrorCodes
         config          = [ordered]@{
             distro_name  = $Config.DistroName
             wsl_user     = $Config.WslUser
@@ -428,7 +431,7 @@ function Get-AgentSystemStatusRecord {
             hermes_gateway_running = $probe.HermesGatewayRunning
             restart_required      = $probe.RestartRequired
         }
-        checks          = @($checks)
+        checks          = $checkRecords
     }
 }
 
@@ -472,11 +475,11 @@ function Get-AgentSystemPreflightRecord {
         })
     }
 
-    return [pscustomobject][ordered]@{
+    return [ordered]@{
         '$schema'            = './schemas/operation.schema.json'
         schema_version       = '1.0'
         operation            = 'preflight'
-        generated_at         = ConvertTo-AgentIsoTimestamp
+        generated_at         = (ConvertTo-AgentIsoTimestamp)
         state                = $statusRecord.state
         summary              = $statusRecord.summary
         mutates_system       = $false
@@ -536,7 +539,7 @@ function Copy-AgentProgramFiles {
     $programRoot = $Config.ProgramRoot
     New-Item -ItemType Directory -Path $programRoot -Force | Out-Null
 
-    $items = @('bin', 'config', 'docker', 'packaging', 'scripts', 'wsl', 'README.md')
+    $items = @('bin', 'config', 'docker', 'packaging', 'schemas', 'scripts', 'wsl', 'README.md')
     foreach ($item in $items) {
         $source = Join-Path $sourceRoot $item
         if (-not (Test-Path -LiteralPath $source)) {
@@ -1026,7 +1029,7 @@ function Build-AgentSystemPackage {
         Remove-Item -LiteralPath $OutputPath -Force
     }
 
-    $include = @('bin', 'config', 'docker', 'packaging', 'scripts', 'wsl', 'README.md')
+    $include = @('bin', 'config', 'docker', 'packaging', 'schemas', 'scripts', 'wsl', 'README.md')
     $temp = Join-Path $env:TEMP ("AgentSystem-Package-" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $temp -Force | Out-Null
 
@@ -1057,6 +1060,7 @@ function Test-AgentSystemProject {
         'README.md',
         'config\agent-system.json',
         'bin\agent-system.ps1',
+        'schemas\operation.schema.json',
         'scripts\lib\AgentSystem.psm1',
         'wsl\bootstrap-ubuntu.sh',
         'docker\docker-compose.yml',

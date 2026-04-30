@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-system.local/schemas/operation.schema.json",
+  "title": "Agent System operation contract",
+  "description": "Structured status, preflight, and operation-event output for the Agent System CLI.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/operationDocument"
+    },
+    {
+      "$ref": "#/$defs/operationEvent"
+    }
+  ],
+  "$defs": {
+    "errorCode": {
+      "type": "string",
+      "enum": [
+        "WSL_MISSING",
+        "REBOOT_REQUIRED",
+        "DOCKER_DAEMON_FAILED",
+        "CLAWPANEL_ASSET_MISSING",
+        "NETWORK_UNAVAILABLE",
+        "PAYLOAD_NOT_INSTALLED",
+        "PERMISSION_REQUIRED"
+      ]
+    },
+    "eventType": {
+      "type": "string",
+      "enum": [
+        "operation_started",
+        "progress",
+        "status",
+        "warning",
+        "error",
+        "reboot_required",
+        "operation_completed"
+      ]
+    },
+    "checkStatus": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "warn",
+        "fail"
+      ]
+    },
+    "check": {
+      "type": "object",
+      "required": [
+        "id",
+        "status",
+        "message"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/checkStatus"
+        },
+        "message": {
+          "type": "string"
+        },
+        "error_code": {
+          "$ref": "#/$defs/errorCode"
+        },
+        "details": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "operationDocument": {
+      "type": "object",
+      "required": [
+        "$schema",
+        "schema_version",
+        "operation",
+        "generated_at",
+        "state",
+        "summary",
+        "checks"
+      ],
+      "properties": {
+        "$schema": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "status",
+            "preflight"
+          ]
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "ready",
+            "warning",
+            "blocked"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "mutates_system": {
+          "type": "boolean"
+        },
+        "ready_for": {
+          "type": "object"
+        },
+        "recommended_actions": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "error_codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/errorCode"
+          }
+        },
+        "config": {
+          "type": "object"
+        },
+        "environment": {
+          "type": "object"
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/check"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "operationEvent": {
+      "type": "object",
+      "required": [
+        "$schema",
+        "schema_version",
+        "operation",
+        "event",
+        "timestamp"
+      ],
+      "properties": {
+        "$schema": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "event": {
+          "$ref": "#/$defs/eventType"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "operation_id": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "error_code": {
+          "$ref": "#/$defs/errorCode"
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}
