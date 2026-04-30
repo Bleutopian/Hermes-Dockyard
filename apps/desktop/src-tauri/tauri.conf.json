@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "appsdesktop",
+  "productName": "Hermes Dockyard",
   "version": "0.1.0",
   "identifier": "com.hermesdockyard.desktop",
   "build": {
@@ -12,9 +12,12 @@
   "app": {
     "windows": [
       {
-        "title": "appsdesktop",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "Hermes Dockyard",
+        "width": 1440,
+        "height": 920,
+        "minWidth": 1180,
+        "minHeight": 760
       }
     ],
     "security": {
