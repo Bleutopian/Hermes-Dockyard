@@ -1,0 +1,27 @@
+name: agent-system
+
+services:
+  hermes-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.hermes-runtime
+    image: agent-system/hermes-runtime:ubuntu24
+    container_name: agent-system-hermes-sandbox
+    restart: unless-stopped
+    init: true
+    tty: true
+    working_dir: /workspace
+    command: ["sleep", "infinity"]
+    volumes:
+      - agent-system-workspace:/workspace
+      - agent-system-cache:/cache
+    networks:
+      - agent-system
+
+networks:
+  agent-system:
+    name: agent-system
+
+volumes:
+  agent-system-workspace:
+  agent-system-cache:

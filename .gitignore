@@ -1,0 +1,14 @@
+# Build and release artifacts
+dist/
+*.zip
+
+# Local runtime state
+.omx/
+*.log
+
+# Windows and editor noise
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/

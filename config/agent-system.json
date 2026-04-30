@@ -1,0 +1,9 @@
+{
+  "distroName": "Ubuntu-24.04",
+  "wslUser": "agent",
+  "installRoot": "%ProgramData%\\AgentSystem",
+  "programRoot": "%ProgramFiles%\\AgentSystem",
+  "taskName": "AgentSystem-WSL-Startup",
+  "clawPanelRepo": "qingchencloud/clawpanel",
+  "hermesInstallUrl": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
+}
