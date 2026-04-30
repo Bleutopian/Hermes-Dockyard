@@ -41,7 +41,10 @@ else {
     Add-Failure -Message 'schemas/checkpoint.schema.json is missing.'
 }
 
-$docs = @(Get-ChildItem -LiteralPath $repoRoot -Recurse -File -Filter *.md | Where-Object { $_.FullName -notlike '*\.omx\*' })
+$docs = @(Get-ChildItem -LiteralPath $repoRoot -Recurse -File -Filter *.md | Where-Object {
+    $relativePath = $_.FullName.Substring($repoRoot.Length).TrimStart('\', '/')
+    return -not ($relativePath -like '.omx\*' -or $relativePath -like '.omx/*')
+})
 $docsRaw = if ($docs.Count -gt 0) { ($docs | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join [Environment]::NewLine } else { '' }
 Assert-True ($docs.Count -gt 0) 'Expected at least one Markdown document outside .omx for privilege-boundary/proof documentation.'
 if ($docs.Count -gt 0) {
@@ -80,7 +83,15 @@ if (Test-Path -LiteralPath $desktopRoot) {
         }
     }
 
-    $desktopFiles = @(Get-ChildItem -LiteralPath $desktopRoot -Recurse -File)
+    $desktopFiles = @(Get-ChildItem -LiteralPath $desktopRoot -Recurse -File | Where-Object {
+        $relativePath = $_.FullName.Substring($desktopRoot.Length).TrimStart('\', '/')
+        if ($relativePath -like 'node_modules\*' -or $relativePath -like 'node_modules/*') { return $false }
+        if ($relativePath -like 'dist\*' -or $relativePath -like 'dist/*') { return $false }
+        if ($relativePath -like 'src-tauri\target\*' -or $relativePath -like 'src-tauri/target/*') { return $false }
+        if ($relativePath -like 'src-tauri\gen\*' -or $relativePath -like 'src-tauri/gen/*') { return $false }
+
+        return ($_.Extension -in @('.ts', '.tsx', '.js', '.jsx', '.json', '.toml', '.md', '.html', '.css'))
+    })
     $desktopRaw = if ($desktopFiles.Count -gt 0) { ($desktopFiles | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue }) -join [Environment]::NewLine } else { '' }
 
     foreach ($token in @('Welcome', 'Preflight', 'Dashboard', 'Logs', 'Settings', 'Tools', 'Video Automation', 'preflight', 'status')) {
