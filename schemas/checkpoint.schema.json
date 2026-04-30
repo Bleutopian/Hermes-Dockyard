@@ -1,0 +1,261 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentsystem.local/schemas/checkpoint.schema.json",
+  "title": "Agent System Operation Checkpoint",
+  "description": "Typed checkpoint emitted for mutating Agent System operations so the desktop shell, elevated helper, and diagnostics tooling can resume work from structured state instead of parsing human text output.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "operation_id",
+    "operation_name",
+    "phase",
+    "status",
+    "started_at",
+    "updated_at",
+    "requires_elevation",
+    "reboot_required"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "operation_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{2,63}$",
+      "description": "Stable operation instance identifier persisted across retries and resume."
+    },
+    "operation_name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{2,63}$",
+      "description": "Allowlisted operation name, for example repair-local-resources."
+    },
+    "operation_type": {
+      "type": "string",
+      "enum": [
+        "repair",
+        "install",
+        "update",
+        "uninstall",
+        "diagnostic"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "running",
+        "blocked",
+        "waiting_reboot",
+        "failed",
+        "completed",
+        "rolled_back"
+      ]
+    },
+    "phase": {
+      "$ref": "#/$defs/phase_state"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "requires_elevation": {
+      "type": "boolean"
+    },
+    "reboot_required": {
+      "type": "boolean"
+    },
+    "resume_command": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "description": "Fixed allowlisted resume command surfaced to the desktop shell or CLI."
+    },
+    "last_error_code": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[A-Z0-9_]+$"
+    },
+    "recovery_action": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/recovery_action"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "caller": {
+      "$ref": "#/$defs/caller"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/artifacts"
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "$defs": {
+    "phase_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "order",
+        "status",
+        "kind",
+        "idempotency"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{2,63}$",
+          "description": "Stable phase key used for checkpoint resume."
+        },
+        "order": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "running",
+            "completed",
+            "failed",
+            "skipped"
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "preflight",
+            "copy",
+            "configure",
+            "verify",
+            "cleanup",
+            "resume"
+          ]
+        },
+        "idempotency": {
+          "type": "string",
+          "enum": [
+            "idempotent",
+            "checkpointed",
+            "non-idempotent"
+          ],
+          "description": "Signals whether the phase can be safely retried or must be resumed from checkpoint state."
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "recovery_action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "description"
+      ],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "retry",
+            "resume",
+            "reboot_then_resume",
+            "repair",
+            "abort"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "caller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "surface"
+      ],
+      "properties": {
+        "surface": {
+          "type": "string",
+          "enum": [
+            "cli",
+            "desktop",
+            "helper",
+            "installer",
+            "scheduled-task"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "checkpoint_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "audit_log_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resource_manifest_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}
